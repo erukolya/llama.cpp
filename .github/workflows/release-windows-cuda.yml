@@ -5,6 +5,11 @@ on:
     tags:
       - "codex-mcp-*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create, for example codex-mcp-v1"
+        required: true
+        default: "codex-mcp-v1"
 
 permissions:
   contents: write
@@ -14,6 +19,15 @@ jobs:
     runs-on: windows-2022
 
     steps:
+      - name: Resolve release tag
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "RELEASE_TAG=${{ github.event.inputs.tag }}" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+            "RELEASE_TAG=${{ github.ref_name }}" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -51,10 +65,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          gh release create $tag `
+          gh release create $env:RELEASE_TAG `
             llama-codex-mcp-win-cuda.zip `
             --repo "${{ github.repository }}" `
-            --title $tag `
+            --target "${{ github.sha }}" `
+            --title $env:RELEASE_TAG `
             --notes "Windows CUDA build with Codex MCP namespace tool flattening." `
             --latest
