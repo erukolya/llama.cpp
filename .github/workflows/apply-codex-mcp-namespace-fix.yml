@@ -1,0 +1,339 @@
+name: Apply Codex MCP Namespace Fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fix:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          submodules: false
+
+      - name: Apply namespace fix
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          chat_cpp = Path('tools/server/server-chat.cpp')
+          chat_h = Path('tools/server/server-chat.h')
+          task_cpp = Path('tools/server/server-task.cpp')
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected 1 match, found {count}')
+              return text.replace(old, new, 1)
+
+          # tools/server/server-chat.cpp
+          text = chat_cpp.read_text(encoding='utf-8')
+
+          if 'server_chat_responses_tool_name' not in text:
+              text = text.replace('#include <sstream>\n', '#include <sstream>\n#include <utility>\n', 1)
+              helper = r'''
+// Flattened Responses-API namespaced tools as "ns_{namespace}___{tool_name}".
+static constexpr const char * RESPONSES_NS_PREFIX = "ns_";
+static constexpr const char * RESPONSES_NS_SEP    = "___";
+
+std::string server_chat_responses_tool_name(const std::string & ns, const std::string & name) {
+    if (ns.empty()) {
+        return name;
+    }
+    return std::string(RESPONSES_NS_PREFIX) + ns + RESPONSES_NS_SEP + name;
+}
+
+std::pair<std::string, std::string> server_chat_responses_split_tool_name(const std::string & name) {
+    const std::string prefix = RESPONSES_NS_PREFIX;
+    const std::string sep    = RESPONSES_NS_SEP;
+    if (name.compare(0, prefix.size(), prefix) != 0) {
+        return { std::string(), name };
+    }
+    const size_t pos = name.find(sep, prefix.size());
+    if (pos == std::string::npos) {
+        return { std::string(), name };
+    }
+    return { name.substr(prefix.size(), pos - prefix.size()), name.substr(pos + sep.size()) };
+}
+
+'''
+              text = text.replace('json server_chat_convert_responses_to_chatcmpl(const json & response_body) {\n', helper + 'json server_chat_convert_responses_to_chatcmpl(const json & response_body) {\n', 1)
+
+          text = text.replace(
+              '{"name",      item.at("name")},',
+              '{"name",      server_chat_responses_tool_name(json_value(item, "namespace", std::string()), item.at("name").get<std::string>())},',
+              1
+          )
+
+          old_tools_block = r'''    if (response_body.contains("tools")) {
+        if (!response_body.at("tools").is_array()) {
+            throw std::invalid_argument("'tools' must be an array of objects");
+        }
+        std::vector<json> chatcmpl_tools;
+        for (json resp_tool : response_body.at("tools")) {
+            json chatcmpl_tool;
+
+            const std::string type = json_value(resp_tool, "type", std::string());
+            if (type == "namespace") {
+                if (resp_tool.contains("tools") && resp_tool.at("tools").is_array()) {
+                    for (json inner_tool : resp_tool.at("tools")) {
+                        const std::string inner_type = json_value(inner_tool, "type", std::string());
+
+                        if (inner_type != "function") {
+                            SRV_WRN("unsupported Responses namespace inner tool type '%s' skipped\n", inner_type.c_str());
+                            continue;
+                        }
+
+                        inner_tool.erase("type");
+
+                        if (!inner_tool.contains("strict")) {
+                            inner_tool["strict"] = true;
+                        }
+
+                        json chatcmpl_namespace_tool;
+                        chatcmpl_namespace_tool["type"] = "function";
+                        chatcmpl_namespace_tool["function"] = inner_tool;
+                        chatcmpl_tools.push_back(chatcmpl_namespace_tool);
+                    }
+                }
+
+                continue;
+            }
+            
+            if (type != "function") {
+                // Non-function Responses tools have no Chat Completions equivalent.
+                SRV_WRN("unsupported Responses tool type '%s' skipped\n", type.c_str());
+                continue;
+            }
+            resp_tool.erase("type");
+            chatcmpl_tool["type"] = "function";
+
+            if (!resp_tool.contains("strict")) {
+                resp_tool["strict"] = true;
+            }
+            chatcmpl_tool["function"] = resp_tool;
+            chatcmpl_tools.push_back(chatcmpl_tool);
+        }
+        chatcmpl_body.erase("tools");
+        if (!chatcmpl_tools.empty()) {
+            chatcmpl_body["tools"] = chatcmpl_tools;
+        }
+    }
+'''
+
+          new_tools_block = r'''    if (response_body.contains("tools")) {
+        if (!response_body.at("tools").is_array()) {
+            throw std::invalid_argument("'tools' must be an array of objects");
+        }
+        std::vector<json> chatcmpl_tools;
+
+        auto add_tool = [&](json fn_tool, const std::string & ns) {
+            fn_tool.erase("type");
+            if (!fn_tool.contains("strict")) {
+                fn_tool["strict"] = true;
+            }
+            if (!ns.empty()) {
+                if (!fn_tool.contains("name") || !fn_tool.at("name").is_string()) {
+                    throw std::invalid_argument("namespaced tool requires 'name'");
+                }
+                fn_tool["name"] = server_chat_responses_tool_name(ns, fn_tool.at("name").get<std::string>());
+            }
+            chatcmpl_tools.push_back(json {
+                {"type",     "function"},
+                {"function", fn_tool},
+            });
+        };
+
+        for (json resp_tool : response_body.at("tools")) {
+            const std::string type = json_value(resp_tool, "type", std::string());
+            if (type == "function") {
+                add_tool(std::move(resp_tool), "");
+            } else if (type == "namespace") {
+                const std::string ns = json_value(resp_tool, "name", std::string());
+                if (ns.empty()) {
+                    throw std::invalid_argument("'namespace' tool requires 'name'");
+                }
+                if (!resp_tool.contains("tools") || !resp_tool.at("tools").is_array()) {
+                    throw std::invalid_argument("'namespace' tool requires 'tools' array");
+                }
+                for (json inner_tool : resp_tool.at("tools")) {
+                    const std::string inner_type = json_value(inner_tool, "type", std::string());
+                    if (inner_type != "function") {
+                        SRV_WRN("unsupported Responses tool type '%s' in namespace '%s' skipped\n", inner_type.c_str(), ns.c_str());
+                        continue;
+                    }
+                    add_tool(std::move(inner_tool), ns);
+                }
+            } else {
+                // Non-function Responses tools have no Chat Completions equivalent.
+                SRV_WRN("unsupported Responses tool type '%s' skipped\n", type.c_str());
+            }
+        }
+        chatcmpl_body.erase("tools");
+        if (!chatcmpl_tools.empty()) {
+            chatcmpl_body["tools"] = chatcmpl_tools;
+        }
+    }
+'''
+
+          if old_tools_block in text:
+              text = replace_once(text, old_tools_block, new_tools_block, 'server-chat.cpp tools block')
+          elif 'auto add_tool = [&](json fn_tool, const std::string & ns)' in text:
+              pass
+          else:
+              raise SystemExit('server-chat.cpp tools block: known block not found')
+
+          chat_cpp.write_text(text, encoding='utf-8')
+
+          # tools/server/server-chat.h
+          text = chat_h.read_text(encoding='utf-8')
+          if '#include <string>' not in text:
+              text = text.replace('#include <nlohmann/json_fwd.hpp>\n', '#include <nlohmann/json_fwd.hpp>\n#include <string>\n#include <utility>\n', 1)
+          if 'server_chat_responses_tool_name' not in text:
+              text = text.replace(
+                  '// Convert Anthropic Messages API format to OpenAI Chat Completions API format\n',
+                  '// Flatten a Responses-API namespaced tool name. Returns name unchanged when ns is empty.\n'
+                  'std::string server_chat_responses_tool_name(const std::string & ns, const std::string & name);\n\n'
+                  '// Split flattened tool name into (namespace, tool_name).\n'
+                  'std::pair<std::string, std::string> server_chat_responses_split_tool_name(const std::string & name);\n\n'
+                  '// Convert Anthropic Messages API format to OpenAI Chat Completions API format\n',
+                  1
+              )
+          chat_h.write_text(text, encoding='utf-8')
+
+          # tools/server/server-task.cpp
+          text = task_cpp.read_text(encoding='utf-8')
+
+          old_final = r'''    for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
+        output.push_back(json {
+            {"id",        "fc_" + tool_call.id},
+            {"type",      "function_call"},
+            {"status",    "completed"},
+            {"arguments", tool_call.arguments},
+            {"call_id",   "call_" + tool_call.id},
+            {"name",      tool_call.name},
+        });
+    }
+'''
+          new_final = r'''    for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
+        auto [ns, tool_name] = server_chat_responses_split_tool_name(tool_call.name);
+        json fc_item = {
+            {"id",        "fc_" + tool_call.id},
+            {"type",      "function_call"},
+            {"status",    "completed"},
+            {"arguments", tool_call.arguments},
+            {"call_id",   "call_" + tool_call.id},
+            {"name",      tool_name},
+        };
+        if (!ns.empty()) {
+            fc_item["namespace"] = ns;
+        }
+        output.push_back(std::move(fc_item));
+    }
+'''
+          if old_final in text:
+              text = replace_once(text, old_final, new_final, 'server-task.cpp final response tool calls')
+
+          old_stream_final = r'''    for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
+        const json output_item = {
+            {"id",        "fc_" + tool_call.id},
+            {"type",      "function_call"},
+            {"status",    "completed"},
+            {"arguments", tool_call.arguments},
+            {"call_id",   "call_" + tool_call.id},
+            {"name",      tool_call.name}
+        };
+        server_sent_events.push_back(json {
+'''
+          new_stream_final = r'''    for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
+        auto [ns, tool_name] = server_chat_responses_split_tool_name(tool_call.name);
+        json output_item = {
+            {"id",        "fc_" + tool_call.id},
+            {"type",      "function_call"},
+            {"status",    "completed"},
+            {"arguments", tool_call.arguments},
+            {"call_id",   "call_" + tool_call.id},
+            {"name",      tool_name}
+        };
+        if (!ns.empty()) {
+            output_item["namespace"] = ns;
+        }
+        server_sent_events.push_back(json {
+'''
+          if old_stream_final in text:
+              text = replace_once(text, old_stream_final, new_stream_final, 'server-task.cpp streaming final response tool calls')
+
+          old_partial = r'''        if (!diff.tool_call_delta.name.empty()) {
+            events.push_back(json {
+                {"event", "response.output_item.added"},
+                {"data", json {
+                    {"type",  "response.output_item.added"},
+                    {"item", json {
+                        {"id",        "fc_" + diff.tool_call_delta.id},
+                        {"arguments", ""},
+                        {"call_id",   "call_" + diff.tool_call_delta.id},
+                        {"name",      diff.tool_call_delta.name},
+                        {"type",      "function_call"},
+                        {"status",    "in_progress"},
+                    }},
+                }},
+            });
+            oai_resp_fc_id = diff.tool_call_delta.id;
+        }
+'''
+          new_partial = r'''        if (!diff.tool_call_delta.name.empty()) {
+            auto [ns, tool_name] = server_chat_responses_split_tool_name(diff.tool_call_delta.name);
+            json item = {
+                {"id",        "fc_" + diff.tool_call_delta.id},
+                {"arguments", ""},
+                {"call_id",   "call_" + diff.tool_call_delta.id},
+                {"name",      tool_name},
+                {"type",      "function_call"},
+                {"status",    "in_progress"},
+            };
+            if (!ns.empty()) {
+                item["namespace"] = ns;
+            }
+            events.push_back(json {
+                {"event", "response.output_item.added"},
+                {"data", json {
+                    {"type",  "response.output_item.added"},
+                    {"item",  item},
+                }},
+            });
+            oai_resp_fc_id = diff.tool_call_delta.id;
+        }
+'''
+          if old_partial in text:
+              text = replace_once(text, old_partial, new_partial, 'server-task.cpp streaming partial response tool calls')
+
+          if 'server_chat_responses_split_tool_name(tool_call.name)' not in text:
+              raise SystemExit('server-task.cpp: expected split helper usage was not inserted')
+
+          task_cpp.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Show diff
+        shell: bash
+        run: |
+          git diff -- tools/server/server-chat.cpp tools/server/server-chat.h tools/server/server-task.cpp
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          if git diff --quiet -- tools/server/server-chat.cpp tools/server/server-chat.h tools/server/server-task.cpp; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tools/server/server-chat.cpp tools/server/server-chat.h tools/server/server-task.cpp
+          git commit -m "server: support Responses namespaced MCP tools"
+          git push origin HEAD:master
