@@ -1,0 +1,60 @@
+name: Build Windows CUDA Release
+
+on:
+  push:
+    tags:
+      - "codex-mcp-*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-cuda:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: "13.0.0"
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -B build-cuda `
+            -DGGML_CUDA=ON `
+            -DGGML_NATIVE=OFF `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build-cuda --config Release -j 4
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist
+          Copy-Item build-cuda/bin/Release/*.exe dist/ -ErrorAction SilentlyContinue
+          Copy-Item build-cuda/bin/Release/*.dll dist/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path dist/* -DestinationPath llama-codex-mcp-win-cuda.zip -Force
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release create $tag `
+            llama-codex-mcp-win-cuda.zip `
+            --repo "${{ github.repository }}" `
+            --title $tag `
+            --notes "Windows CUDA build with Codex MCP namespace tool flattening." `
+            --latest
