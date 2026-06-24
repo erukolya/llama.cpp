@@ -258,6 +258,32 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             json chatcmpl_tool;
 
             const std::string type = json_value(resp_tool, "type", std::string());
+            if (type == "namespace") {
+                if (resp_tool.contains("tools") && resp_tool.at("tools").is_array()) {
+                    for (json inner_tool : resp_tool.at("tools")) {
+                        const std::string inner_type = json_value(inner_tool, "type", std::string());
+
+                        if (inner_type != "function") {
+                            SRV_WRN("unsupported Responses namespace inner tool type '%s' skipped\n", inner_type.c_str());
+                            continue;
+                        }
+
+                        inner_tool.erase("type");
+
+                        if (!inner_tool.contains("strict")) {
+                            inner_tool["strict"] = true;
+                        }
+
+                        json chatcmpl_namespace_tool;
+                        chatcmpl_namespace_tool["type"] = "function";
+                        chatcmpl_namespace_tool["function"] = inner_tool;
+                        chatcmpl_tools.push_back(chatcmpl_namespace_tool);
+                    }
+                }
+
+                continue;
+            }
+            
             if (type != "function") {
                 // Non-function Responses tools have no Chat Completions equivalent.
                 SRV_WRN("unsupported Responses tool type '%s' skipped\n", type.c_str());
